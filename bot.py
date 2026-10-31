@@ -3,17 +3,15 @@ import io
 import asyncio
 import logging
 import math
-import random
 import urllib.parse
 from PIL import Image, ImageDraw, ImageFilter, ImageEnhance, ImageOps
 import aiohttp
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.types import (
-    Message, BufferedInputFile, InlineKeyboardMarkup, InlineKeyboardButton,
-    ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
+    Message, BufferedInputFile, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
 )
-from aiogram.filters import CommandStart, Command
+from aiogram.filters import CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -48,7 +46,7 @@ SHAPES = {
     "сердце": "heart",
 }
 
-# ==================== FSM ====================
+# ==================== FSM (Состояния) ====================
 class UserState(StatesGroup):
     waiting_image = State()
     waiting_command = State()
@@ -67,7 +65,7 @@ def get_main_keyboard():
     ]
     return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True, input_field_placeholder="Напиши команду или выбери кнопку...")
 
-# ==================== ПАРСИНГ ====================
+# ==================== ПАРСИНГ КОМАНД ====================
 def parse_filter_command(text: str):
     lower = text.lower().strip()
     filter_info = None
@@ -99,7 +97,7 @@ def parse_filter_command(text: str):
     return {"filter": filter_info, "shape": shape, "dimensions": dimensions}
 
 
-# ==================== ФИЛЬТРЫ (КАК БЫЛО) ====================
+# ==================== ФИЛЬТРЫ ====================
 def apply_pixel_filter(img, intensity):
     pixel_size = max(3, round(25 * intensity)) 
     w, h = img.size
@@ -326,7 +324,6 @@ async def process_search_query(message: Message, state: FSMContext):
     status = await message.answer(f"⏳ Ищу информацию по запросу: <i>{query}</i>...", parse_mode=ParseMode.HTML)
     result_text = await do_internet_search(query)
     
-    # Если текст длинный, отправляем частями (лимит Телеграма 4096)
     if len(result_text) > 4000:
         for i in range(0, len(result_text), 4000):
             await message.answer(result_text[i:i+4000], parse_mode=ParseMode.HTML, disable_web_page_preview=True)
@@ -371,7 +368,6 @@ async def process_add_text(message: Message, state: FSMContext):
     
     loop = asyncio.get_running_loop()
     def add_text():
-        from PIL import ImageDraw, ImageFont
         img_copy = img.copy().convert("RGB")
         draw = ImageDraw.Draw(img_copy)
         try:
@@ -384,12 +380,10 @@ async def process_add_text(message: Message, state: FSMContext):
         x = (img_copy.width - text_w) / 2
         y = img_copy.height - text_h - 20
         
-        # Черная обводка
         draw.text((x-2, y), custom_text, font=font, fill="black")
         draw.text((x+2, y), custom_text, font=font, fill="black")
         draw.text((x, y-2), custom_text, font=font, fill="black")
         draw.text((x, y+2), custom_text, font=font, fill="black")
-        # Белый текст
         draw.text((x, y), custom_text, font=font, fill="white")
         return img_copy
 
@@ -409,7 +403,6 @@ async def handle_text(message: Message, state: FSMContext, bot: Bot):
     lower = text.lower().strip()
     uid = message.from_user.id
     
-    # Если пользователь ввел поиск или рисование прямо в чат без кнопки
     if lower.startswith("поиск ") or lower.startswith("найди "):
         query = text.split(" ", 1)[1]
         status = await message.answer(f"⏳ Ищу: <i>{query}</i>...", parse_mode=ParseMode.HTML)
@@ -429,7 +422,6 @@ async def handle_text(message: Message, state: FSMContext, bot: Bot):
             await status.edit_text("❌ Ошибка генерации.")
         return
 
-    # Обработка фото фильтрами
     img = user_images.get(uid)
     if not img:
         await message.answer("Сначала отправь изображение 📷, или используй кнопки внизу.", reply_markup=get_main_keyboard())
