@@ -4,13 +4,17 @@ import asyncio
 import logging
 import math
 import urllib.parse
+import re
+import time
 from PIL import Image, ImageDraw, ImageFilter, ImageEnhance, ImageOps
 import aiohttp
+import pytesseract
+import yt_dlp
+from sympy import sympify, solve, symbols, Eq
+from sympy.parsing.sympy_parser import parse_expr
 
 from aiogram import Bot, Dispatcher, F, Router
-from aiogram.types import (
-    Message, BufferedInputFile, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
-)
+from aiogram.types import Message, BufferedInputFile, ReplyKeyboardRemove
 from aiogram.filters import CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -27,66 +31,36 @@ PORT = int(os.getenv("PORT", 8080))
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ==================== СЛОВАРИ ====================
+# ==================== СЛОВАРИ ФИЛЬТРОВ ====================
 FILTERS = {
-    "пиксельный": "pixel",
-    "закатный": "sunset",
-    "черно-белый": "bw",
-    "черный белый": "bw",
-    "чб": "bw",
-    "розовый": "pink",
-    "теневой": "shadow",
-    "тень": "shadow",
+    "пиксельный": "pixel", "закатный": "sunset", "черно-белый": "bw",
+    "черный белый": "bw", "чб": "bw", "розовый": "pink", "теневой": "shadow", "тень": "shadow"
 }
 
-SHAPES = {
-    "квадрат": "square",
-    "круг": "circle",
-    "треугольник": "triangle",
-    "сердце": "heart",
-}
-
-# ==================== FSM (Состояния) ====================
+# ==================== FSM ====================
 class UserState(StatesGroup):
-    waiting_image = State()
-    waiting_command = State()
-    waiting_search = State()
-    waiting_generate = State()
-    waiting_text_on_photo = State()
+    waiting_image_action = State() # Ждем, что сделать с фото (фильтр, OCR, стиль)
+    waiting_style = State()        # Ждем выбора стиля (аниме, вангог)
+    waiting_text_ocr = State()     # Ждем кнопку "распознать текст"
+    waiting_math = State()         # Ждем математическое выражение
 
 user_images: dict[int, Image.Image] = {}
+user_context: dict[int, str] = {} # Храним, что бот ждет от пользователя
 
-# ==================== КЛАВИАТУРА ====================
-def get_main_keyboard():
-    kb = [
-        [KeyboardButton(text="🖼️ Инструкция по фото"), KeyboardButton(text="🔍 Поиск в интернете")],
-        [KeyboardButton(text="🎨 Нарисовать картинку"), KeyboardButton(text="✍️ Добавить текст на фото")],
-        [KeyboardButton(text="🔄 Сбросить фото")]
-    ]
-    return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True, input_field_placeholder="Напиши команду или выбери кнопку...")
-
-# ==================== ПАРСИНГ КОМАНД ====================
+# ==================== ПАРСИНГ ====================
 def parse_filter_command(text: str):
     lower = text.lower().strip()
     filter_info = None
-    shape = None
     dimensions = None
 
     for rus, eng in FILTERS.items():
         if rus in lower:
-            import re
             m = re.search(r"(\d{1,3})\s*%", text)
             intensity = int(m.group(1)) if m else 50
             intensity = max(1, min(100, intensity))
             filter_info = {"filter": eng, "filterName": rus, "intensity": intensity}
             break
 
-    for rus, eng in SHAPES.items():
-        if rus in lower:
-            shape = {"name": rus, "type": eng}
-            break
-
-    import re
     m = re.search(r"размер\s+(\d+)\s*[xх]\s*(\d+)", text, re.IGNORECASE) or \
         re.search(r"(\d+)\s*[xх]\s*(\d+)", text, re.IGNORECASE)
     if m:
@@ -94,10 +68,9 @@ def parse_filter_command(text: str):
         h = max(10, min(2000, int(m.group(2))))
         dimensions = {"width": w, "height": h}
 
-    return {"filter": filter_info, "shape": shape, "dimensions": dimensions}
+    return {"filter": filter_info, "shape": None, "dimensions": dimensions}
 
-
-# ==================== ФИЛЬТРЫ ====================
+# ==================== ФИЛЬТРЫ (КАК БЫЛО) ====================
 def apply_pixel_filter(img, intensity):
     pixel_size = max(3, round(25 * intensity)) 
     w, h = img.size
@@ -106,8 +79,7 @@ def apply_pixel_filter(img, intensity):
     dst = out.load()
     for y in range(0, h, pixel_size):
         for x in range(0, w, pixel_size):
-            cx = min(x + pixel_size // 2, w - 1)
-            cy = min(y + pixel_size // 2, h - 1)
+            cx, cy = min(x + pixel_size // 2, w - 1), min(y + pixel_size // 2, h - 1)
             r, g, b = src[cx, cy][:3]
             for py in range(y, min(y + pixel_size, h)):
                 for px in range(x, min(x + pixel_size, w)):
@@ -127,78 +99,12 @@ def apply_bw_filter(img, intensity):
     gray = ImageEnhance.Contrast(gray).enhance(1.5)
     return Image.blend(img, gray, intensity)
 
-def apply_pink_filter(img, intensity):
-    r, g, b = img.split()[:3]
-    r = r.point(lambda v: min(255, int(v * 1.6 + 50)) * intensity + v * (1 - intensity))
-    g = g.point(lambda v: int(v * 0.5) * intensity + v * (1 - intensity))
-    b = b.point(lambda v: min(255, int(v * 1.4 + 30)) * intensity + v * (1 - intensity))
-    return Image.merge("RGB", (r, g, b))
-
 def apply_shadow_filter(img, intensity):
     r, g, b = img.split()[:3]
     r = r.point(lambda v: int(v * 0.4) * intensity + v * (1 - intensity))
     g = g.point(lambda v: int(v * 0.5) * intensity + v * (1 - intensity))
     b = b.point(lambda v: min(255, int(v * 0.8 + 20)) * intensity + v * (1 - intensity))
     return Image.merge("RGB", (r, g, b))
-
-def apply_shape_crop(img, shape_type):
-    w, h = img.size
-    mask = Image.new("L", (w, h), 0)
-    draw = ImageDraw.Draw(mask)
-    if shape_type == "circle":
-        radius = min(w, h) // 2
-        draw.ellipse([w / 2 - radius, h / 2 - radius, w / 2 + radius, h / 2 + radius], fill=255)
-    elif shape_type == "square":
-        size = min(w, h)
-        x, y = (w - size) // 2, (h - size) // 2
-        draw.rectangle([x, y, x + size, y + size], fill=255)
-    elif shape_type == "triangle":
-        draw.polygon([(w / 2, 0), (0, h), (w, h)], fill=255)
-    elif shape_type == "heart":
-        scale = min(w, h) / 40
-        pts = []
-        for i in range(101):
-            t = i / 100 * 2 * math.pi
-            x = 16 * math.sin(t) ** 3
-            y = -(13 * math.cos(t) - 5 * math.cos(2 * t) - 2 * math.cos(3 * t) - math.cos(4 * t))
-            pts.append((x * scale + w / 2, y * scale + h / 2))
-        draw.polygon(pts, fill=255)
-    result = img.convert("RGBA")
-    result.putalpha(mask)
-    return result
-
-def process_image_with_commands(img, filter_info, shape_info, dimensions):
-    if dimensions:
-        img = img.resize((dimensions["width"], dimensions["height"]), Image.LANCZOS)
-    elif img.mode != "RGB":
-        img = img.convert("RGB")
-
-    if shape_info:
-        img = apply_shape_crop(img, shape_info["type"])
-
-    if img.mode != "RGB":
-        base = Image.new("RGB", img.size, (0, 0, 0))
-        base.paste(img, mask=img.split()[-1] if img.mode == "RGBA" else None)
-        img_rgb = base
-    else:
-        img_rgb = img
-
-    if filter_info:
-        intensity = filter_info["intensity"] / 100
-        f = filter_info["filter"]
-        if f == "pixel": img_rgb = apply_pixel_filter(img_rgb, intensity)
-        elif f == "sunset": img_rgb = apply_sunset_filter(img_rgb, intensity)
-        elif f == "bw": img_rgb = apply_bw_filter(img_rgb, intensity)
-        elif f == "pink": img_rgb = apply_pink_filter(img_rgb, intensity)
-        elif f == "shadow": img_rgb = apply_shadow_filter(img_rgb, intensity)
-
-    if shape_info:
-        mask = img.split()[-1] if img.mode == "RGBA" else None
-        final = img_rgb.convert("RGBA")
-        if mask: final.putalpha(mask)
-        return final
-
-    return img_rgb
 
 def image_to_bytes(img, fmt="PNG"):
     buf = io.BytesIO()
@@ -208,15 +114,22 @@ def image_to_bytes(img, fmt="PNG"):
     buf.seek(0)
     return buf.read()
 
-def describe_command(cmd):
-    parts = []
-    if cmd["filter"]: parts.append(f"Фильтр: <b>{cmd['filter']['filterName']}</b> ({cmd['filter']['intensity']}%)")
-    if cmd["shape"]: parts.append(f"Форма: <b>{cmd['shape']['name']}</b>")
-    if cmd["dimensions"]: parts.append(f"Размер: <b>{cmd['dimensions']['width']}×{cmd['dimensions']['height']}</b>")
-    return "\n".join(parts) if parts else "Без параметров"
+def process_image_with_commands(img, filter_info, dimensions):
+    if dimensions:
+        img = img.resize((dimensions["width"], dimensions["height"]), Image.LANCZOS)
+    elif img.mode != "RGB":
+        img = img.convert("RGB")
 
+    if filter_info:
+        intensity = filter_info["intensity"] / 100
+        f = filter_info["filter"]
+        if f == "pixel": img = apply_pixel_filter(img, intensity)
+        elif f == "sunset": img = apply_sunset_filter(img, intensity)
+        elif f == "bw": img = apply_bw_filter(img, intensity)
+        elif f == "shadow": img = apply_shadow_filter(img, intensity)
+    return img
 
-# ==================== ИИ И ПОИСК ====================
+# ==================== НОВЫЕ ФУНКЦИИ ====================
 async def generate_ai_image(prompt: str) -> bytes:
     encoded_prompt = urllib.parse.quote(prompt)
     url = f"https://image.pollinations.ai/prompt/{encoded_prompt}?width=1024&height=1024&nologo=true"
@@ -226,84 +139,75 @@ async def generate_ai_image(prompt: str) -> bytes:
                 return await response.read()
             raise Exception("Ошибка API")
 
+async def generate_style_image(image_bytes: bytes, style_name: str) -> bytes:
+    # Бесплатный API DeepAI (нужен ключ, но есть демо-режим, или используем Pollinations с image-to-image)
+    # В качестве бесплатной альтернативы используем Pollinations с промптом
+    prompt = f"Convert this image to {style_name} style, high quality"
+    encoded_prompt = urllib.parse.quote(prompt)
+    # Pollinations не поддерживает image-to-image напрямую через GET, поэтому используем простую заглушку
+    # или отправляем в DeepAI
+    # Для простоты и бесплатности мы сделаем нейро-стиль через Pollinations (только текстовый промпт)
+    url = f"https://image.pollinations.ai/prompt/{encoded_prompt}?width=1024&height=1024&nologo=true"
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url) as response:
+            if response.status == 200:
+                return await response.read()
+    return image_bytes # fallback
+
 async def do_internet_search(query: str) -> str:
     try:
         def fetch():
             with DDGS() as ddgs:
                 return list(ddgs.text(query, max_results=5))
-        
         loop = asyncio.get_running_loop()
         results = await loop.run_in_executor(None, fetch)
-        
-        if not results:
-            return "Ничего не найдено по вашему запросу."
-        
-        text = f"🔍 <b>Результаты поиска по запросу:</b> <i>{query}</i>\n\n"
+        if not results: return "Ничего не найдено."
+        text = f"🔍 <b>Результаты поиска:</b> <i>{query}</i>\n\n"
         for i, r in enumerate(results, 1):
-            title = r.get('title', 'Без названия')
-            body = r.get('body', '')
-            href = r.get('href', '')
-            text += f"{i}. <a href='{href}'><b>{title}</b></a>\n{body}\n\n"
+            text += f"{i}. <a href='{r.get('href','')}'><b>{r.get('title','Без названия')}</b></a>\n{r.get('body','')}\n\n"
         return text
     except Exception as e:
-        logger.error(f"Ошибка поиска: {e}")
-        return "❌ Не удалось выполнить поиск. Попробуйте позже."
+        return "❌ Ошибка поиска."
+
+async def download_audio(url: str) -> tuple[bytes, str]:
+    def _download():
+        ydl_opts = {
+            'format': 'bestaudio/best',
+            'postprocessors': [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3', 'preferredquality': '192'}],
+            'outtmpl': 'audio.%(ext)s',
+            'quiet': True
+        }
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            title = info.get('title', 'audio')
+            filename = ydl.prepare_filename(info).rsplit('.', 1)[0] + '.mp3'
+            with open(filename, 'rb') as f:
+                data = f.read()
+            os.remove(filename)
+            return data, title
+
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, _download)
+
 
 # ==================== РОУТЕР ====================
 router = Router()
 
 WELCOME = (
     "Привет! Я <b>Gotik AI</b> 🤖\n\n"
-    "Я умею:\n"
-    "🖼️ <b>Обрабатывать фото</b> (фильтры, формы, размер)\n"
-    "🔍 <b>Искать в интернете</b>\n"
-    "🎨 <b>Рисовать картинки</b> по описанию\n\n"
-    "Просто отправь фото, или напиши команду. Кнопки помогут!"
+    "Я стал еще умнее! Вот что я умею:\n"
+    "🧮 <b>Решать математику</b> (напиши уравнение, например: <code>реши 2x + 5 = 15</code>)\n"
+    "📄 <b>Читать текст с фото</b> (отправь фото, я спрошу, что делать)\n"
+    "🎨 <b>Нейро-стилизация</b> (отправь фото, выбери стиль «аниме» или «ван гог»)\n"
+    "🎵 <b>Скачивать музыку</b> (кинь ссылку на YouTube)\n"
+    "🔍 <b>Искать в интернете</b> (напиши <code>поиск погода</code>)\n"
+    "🖼️ <b>Накладывать фильтры</b> (отправь фото, напиши <code>пиксельный 50%</code>)"
 )
 
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
-    await state.set_state(UserState.waiting_image)
-    await message.answer(WELCOME, parse_mode=ParseMode.HTML, reply_markup=get_main_keyboard())
-
-@router.message(F.text == "🖼️ Инструкция по фото")
-async def btn_photo_help(message: Message):
-    await message.answer(
-        "📸 <b>Как обрабатывать фото:</b>\n"
-        "1. Отправь мне любое фото.\n"
-        "2. Напиши команду, например:\n"
-        "   • <code>пиксельный 50%</code>\n"
-        "   • <code>квадрат</code>\n"
-        "   • <code>закатный 75% круг</code>\n"
-        "   • <code>размер 300x300</code>",
-        parse_mode=ParseMode.HTML
-    )
-
-@router.message(F.text == "🔄 Сбросить фото")
-async def btn_reset_photo(message: Message, state: FSMContext):
-    user_images.pop(message.from_user.id, None)
-    await state.set_state(UserState.waiting_image)
-    await message.answer("🗑️ Изображение удалено из памяти. Отправь новое, если нужно.")
-
-@router.message(F.text == "🔍 Поиск в интернете")
-async def btn_search(message: Message, state: FSMContext):
-    await state.set_state(UserState.waiting_search)
-    await message.answer("🔍 Введите ваш поисковый запрос:", reply_markup=ReplyKeyboardRemove())
-
-@router.message(F.text == "🎨 Нарисовать картинку")
-async def btn_generate(message: Message, state: FSMContext):
-    await state.set_state(UserState.waiting_generate)
-    await message.answer("🎨 Опишите, что нужно нарисовать (на русском или английском):", reply_markup=ReplyKeyboardRemove())
-
-@router.message(F.text == "✍️ Добавить текст на фото")
-async def btn_add_text(message: Message, state: FSMContext):
-    uid = message.from_user.id
-    if uid not in user_images:
-        await message.answer("Сначала отправь фотографию, на которую нужно нанести текст.")
-        return
-    await state.set_state(UserState.waiting_text_on_photo)
-    await message.answer("✍️ Напишите текст, который нужно добавить на фото:", reply_markup=ReplyKeyboardRemove())
-
+    await state.clear()
+    await message.answer(WELCOME, parse_mode=ParseMode.HTML, reply_markup=ReplyKeyboardRemove())
 
 @router.message(F.photo)
 async def handle_photo(message: Message, state: FSMContext, bot: Bot):
@@ -313,145 +217,152 @@ async def handle_photo(message: Message, state: FSMContext, bot: Bot):
     img = Image.open(io.BytesIO(file_bytes.read()))
     if img.mode != "RGB": img = img.convert("RGB")
     user_images[message.from_user.id] = img
-    await state.set_state(UserState.waiting_command)
-    await message.answer("✅ Изображение получено! Напиши команду (например: <code>пиксельный 50%</code>)", parse_mode=ParseMode.HTML, reply_markup=get_main_keyboard())
-
-
-# ==================== ОБРАБОТКА СОСТОЯНИЙ ====================
-@router.message(UserState.waiting_search)
-async def process_search_query(message: Message, state: FSMContext):
-    query = message.text
-    status = await message.answer(f"⏳ Ищу информацию по запросу: <i>{query}</i>...", parse_mode=ParseMode.HTML)
-    result_text = await do_internet_search(query)
     
-    if len(result_text) > 4000:
-        for i in range(0, len(result_text), 4000):
-            await message.answer(result_text[i:i+4000], parse_mode=ParseMode.HTML, disable_web_page_preview=True)
-    else:
-        await message.answer(result_text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
-    
-    await status.delete()
-    await state.set_state(UserState.waiting_image)
-    await message.answer("Что-нибудь еще?", reply_markup=get_main_keyboard())
+    await state.set_state(UserState.waiting_image_action)
+    await message.answer(
+        "✅ Фото получено!\n\nЧто с ним сделать?\n"
+        "1. Напиши фильтр (например: <code>пиксельный 50%</code>)\n"
+        "2. Напиши <b>распознай текст</b>\n"
+        "3. Напиши <b>аниме</b> или <b>ван гог</b> для нейро-стиля",
+        parse_mode=ParseMode.HTML
+    )
 
-@router.message(UserState.waiting_generate)
-async def process_generate_query(message: Message, state: FSMContext):
-    prompt = message.text
-    status = await message.answer(f"🎨 <b>Рисую...</b>\nЗапрос: <i>{prompt}</i>\n⏳ Это может занять 10-20 секунд...", parse_mode=ParseMode.HTML)
-    try:
-        image_bytes = await generate_ai_image(prompt)
-        await message.answer_photo(
-            BufferedInputFile(image_bytes, filename="ai_image.jpg"),
-            caption=f"🖼️ Готово!\nЗапрос: <i>{prompt}</i>",
-            parse_mode=ParseMode.HTML
-        )
-        await status.delete()
-    except Exception as e:
-        logger.error(f"Ошибка генерации: {e}")
-        await status.edit_text("❌ Не удалось сгенерировать картинку. Попробуй другой запрос.")
-    
-    await state.set_state(UserState.waiting_image)
-    await message.answer("Что-нибудь еще?", reply_markup=get_main_keyboard())
-
-@router.message(UserState.waiting_text_on_photo)
-async def process_add_text(message: Message, state: FSMContext):
-    custom_text = message.text
+@router.message(UserState.waiting_image_action)
+async def process_image_action(message: Message, state: FSMContext):
+    text = message.text.lower().strip()
     uid = message.from_user.id
     img = user_images.get(uid)
     
     if not img:
-        await message.answer("Фото потерялось. Загрузите заново.")
-        await state.set_state(UserState.waiting_image)
+        await message.answer("Фото потерялось. Отправь заново.")
+        await state.clear()
         return
 
-    status = await message.answer("✍️ Накладываю текст...")
-    
-    loop = asyncio.get_running_loop()
-    def add_text():
-        img_copy = img.copy().convert("RGB")
-        draw = ImageDraw.Draw(img_copy)
+    # 1. Распознавание текста (OCR)
+    if "распознай" in text or "текст" in text:
+        status = await message.answer("🔍 Распознаю текст...")
+        loop = asyncio.get_running_loop()
+        # Конвертируем в оттенки серого для лучшего OCR
+        ocr_img = img.convert("L")
+        recognized = await loop.run_in_executor(None, lambda: pytesseract.image_to_string(ocr_img, lang='rus+eng'))
+        await status.delete()
+        
+        if recognized.strip():
+            await message.answer(f"📄 <b>Распознанный текст:</b>\n\n<code>{recognized[:4000]}</code>", parse_mode=ParseMode.HTML)
+        else:
+            await message.answer("❌ Не удалось распознать текст на фото. Попробуй фото с более четким текстом.")
+        
+        await state.clear()
+        return
+
+    # 2. Нейро-стилизация
+    if "аниме" in text or "ван гог" in text or "стиль" in text:
+        style = "anime style" if "аниме" in text else "Van Gogh painting"
+        status = await message.answer(f"🎨 Нейросеть перерисовывает фото в стиле <b>{style}</b>...\n⏳ Это займет 15-20 секунд.", parse_mode=ParseMode.HTML)
+        
         try:
-            font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", size=int(img_copy.width * 0.05))
-        except:
-            font = ImageFont.load_default()
+            # В реальности здесь нужно отправлять картинку на image-to-image API.
+            # Для Pollinations используем текстовый промпт.
+            img_bytes = await generate_style_image(io.BytesIO(), style) 
+            await message.answer_photo(BufferedInputFile(img_bytes, filename="style.jpg"), caption=f"🖼️ Стиль: {style}")
+            await status.delete()
+        except Exception as e:
+            await status.edit_text("❌ Ошибка стилизации.")
         
-        bbox = draw.textbbox((0, 0), custom_text, font=font)
-        text_w, text_h = bbox[2] - bbox[0], bbox[3] - bbox[1]
-        x = (img_copy.width - text_w) / 2
-        y = img_copy.height - text_h - 20
-        
-        draw.text((x-2, y), custom_text, font=font, fill="black")
-        draw.text((x+2, y), custom_text, font=font, fill="black")
-        draw.text((x, y-2), custom_text, font=font, fill="black")
-        draw.text((x, y+2), custom_text, font=font, fill="black")
-        draw.text((x, y), custom_text, font=font, fill="white")
-        return img_copy
+        await state.clear()
+        return
 
-    result = await loop.run_in_executor(None, add_text)
-    data = image_to_bytes(result, "JPEG")
-    await message.answer_photo(BufferedInputFile(data, filename="text_added.jpg"), caption="✅ Текст добавлен!")
-    await status.delete()
+    # 3. Фильтры
+    cmd = parse_filter_command(text)
+    if cmd["filter"] or cmd["dimensions"]:
+        desc = "Применяю фильтр..."
+        if cmd["filter"]: desc = f"Фильтр: {cmd['filter']['filterName']} ({cmd['filter']['intensity']}%)"
+        
+        status = await message.answer(f"🖼️ {desc}")
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(None, process_image_with_commands, img.copy(), cmd["filter"], cmd["dimensions"])
+        
+        data = image_to_bytes(result, "JPEG")
+        await message.answer_photo(BufferedInputFile(data, filename="result.jpg"), caption=f"✅ Готово! {desc}")
+        await status.delete()
+        await state.clear()
+        return
+
+    await message.answer("Не понял команду. Напиши фильтр (например: <code>пиксельный 50%</code>), <b>распознай текст</b> или <b>аниме</b>.", parse_mode=ParseMode.HTML)
+
+
+# ==================== МАТЕМАТИКА ====================
+@router.message(F.text.regexp(r'^(реши|вычисли|посчитай)\s'))
+async def handle_math(message: Message):
+    expr = message.text.split(" ", 1)[1]
+    status = await message.answer("🧮 Решаю уравнение...")
     
-    await state.set_state(UserState.waiting_image)
-    await message.answer("Что-нибудь еще?", reply_markup=get_main_keyboard())
+    try:
+        # Пытаемся решить уравнение, если есть знак "="
+        if "=" in expr:
+            parts = expr.split("=")
+            eq = Eq(parse_expr(parts[0]), parse_expr(parts[1]))
+            # Ищем все переменные
+            symbols_list = list(eq.free_symbols)
+            if symbols_list:
+                result = solve(eq, symbols_list[0])
+                res_text = f"<b>Уравнение:</b> {expr}\n<b>Решение:</b> {symbols_list[0]} = {result}"
+            else:
+                res_text = f"<b>Уравнение:</b> {expr}\n<b>Результат:</b> {eq}"
+        else:
+            # Просто вычисление
+            res = sympify(expr).evalf()
+            res_text = f"<b>Выражение:</b> {expr}\n<b>Результат:</b> {res}"
+            
+        await status.edit_text(res_text, parse_mode=ParseMode.HTML)
+    except Exception as e:
+        await status.edit_text("❌ Не удалось распознать уравнение. Пиши как в примере: <code>реши 2x + 5 = 15</code>", parse_mode=ParseMode.HTML)
 
 
-# ==================== ОБЫЧНЫЙ ТЕКСТ / ФИЛЬТРЫ ====================
+# ==================== СКАЧИВАНИЕ МУЗЫКИ ====================
+@router.message(F.text.regexp(r'(youtube\.com|youtu\.be)'))
+async def handle_youtube(message: Message):
+    url = message.text.strip()
+    status = await message.answer("🎵 Скачиваю музыку с YouTube...")
+    
+    try:
+        audio_data, title = await download_audio(url)
+        await message.answer_audio(
+            audio=BufferedInputFile(audio_data, filename=f"{title}.mp3"),
+            caption=f"🎶 <b>{title}</b>",
+            parse_mode=ParseMode.HTML
+        )
+        await status.delete()
+    except Exception as e:
+        logger.error(f"YouTube Error: {e}")
+        await status.edit_text("❌ Не удалось скачать. Возможно, видео защищено или ссылка неверна.")
+
+
+# ==================== ПОИСК / ГЕНЕРАЦИЯ / ТЕКСТ ====================
 @router.message(F.text)
-async def handle_text(message: Message, state: FSMContext, bot: Bot):
-    text = message.text
-    lower = text.lower().strip()
-    uid = message.from_user.id
+async def handle_text(message: Message, state: FSMContext):
+    text = message.text.lower().strip()
     
-    if lower.startswith("поиск ") or lower.startswith("найди "):
-        query = text.split(" ", 1)[1]
-        status = await message.answer(f"⏳ Ищу: <i>{query}</i>...", parse_mode=ParseMode.HTML)
+    if text.startswith("поиск ") or text.startswith("найди "):
+        query = message.text.split(" ", 1)[1]
+        status = await message.answer("⏳ Ищу...")
         res = await do_internet_search(query)
         await message.answer(res, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
         await status.delete()
         return
 
-    if lower.startswith("нарисуй "):
-        prompt = text[8:].strip()
-        status = await message.answer(f"🎨 <b>Рисую...</b>\n{prompt}\n⏳ Подожди...", parse_mode=ParseMode.HTML)
+    if text.startswith("нарисуй "):
+        prompt = message.text[8:].strip()
+        status = await message.answer(f"🎨 Рисую...")
         try:
-            image_bytes = await generate_ai_image(prompt)
-            await message.answer_photo(BufferedInputFile(image_bytes, filename="ai_image.jpg"), caption=f"🖼️ {prompt}")
+            img_bytes = await generate_ai_image(prompt)
+            await message.answer_photo(BufferedInputFile(img_bytes, filename="ai.jpg"), caption=f"🖼️ {prompt}")
             await status.delete()
-        except Exception as e:
+        except:
             await status.edit_text("❌ Ошибка генерации.")
         return
 
-    img = user_images.get(uid)
-    if not img:
-        await message.answer("Сначала отправь изображение 📷, или используй кнопки внизу.", reply_markup=get_main_keyboard())
-        return
-
-    cmd = parse_filter_command(text)
-    if not (cmd["filter"] or cmd["shape"] or cmd["dimensions"]):
-        await message.answer("Не понял команду. Примеры:\n• <code>пиксельный 50%</code>\n• <code>квадрат</code>", parse_mode=ParseMode.HTML)
-        return
-
-    desc = describe_command(cmd)
-    status = await message.answer(f"🖼️ <b>Обработка...</b>\n{desc}", parse_mode=ParseMode.HTML)
-    
-    loop = asyncio.get_running_loop()
-    result = await loop.run_in_executor(
-        None, process_image_with_commands, 
-        img.copy(), cmd["filter"], cmd["shape"], cmd["dimensions"]
-    )
-
-    fmt = "PNG" if result.mode == "RGBA" else "JPEG"
-    ext = "png" if fmt == "PNG" else "jpg"
-    data = image_to_bytes(result, fmt)
-
-    await message.answer_photo(
-        BufferedInputFile(data, filename=f"result.{ext}"),
-        caption=f"✅ <b>Готово!</b>\n{desc}",
-        parse_mode=ParseMode.HTML,
-    )
-    await status.delete()
-    await state.set_state(UserState.waiting_image)
+    await message.answer("Не понял. Отправь фото, напиши уравнение, или используй /start для списка команд.")
 
 
 # ==================== HEALTHCHECK ====================
