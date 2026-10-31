@@ -3,6 +3,7 @@ import io
 import asyncio
 import logging
 import math
+import random
 from PIL import Image, ImageDraw, ImageFilter, ImageEnhance
 
 from aiogram import Bot, Dispatcher, F, Router
@@ -13,6 +14,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramBadRequest
 from aiohttp import web
 
 # ==================== КОНФИГ ====================
@@ -22,7 +24,7 @@ PORT = int(os.getenv("PORT", 8080))
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ==================== СЛОВАРИ (из HTML) ====================
+# ==================== СЛОВАРИ ====================
 FILTERS = {
     "пиксельный": "pixel",
     "закатный": "sunset",
@@ -41,23 +43,19 @@ SHAPES = {
     "сердце": "heart",
 }
 
-# ==================== FSM ====================
 class UserState(StatesGroup):
     waiting_image = State()
     waiting_command = State()
 
-# Хранилище последнего изображения пользователя (в памяти)
 user_images: dict[int, Image.Image] = {}
 
-# ==================== ПАРСИНГ КОМАНДЫ ====================
+# ==================== ПАРСИНГ ====================
 def parse_filter_command(text: str):
-    """Полный аналог parseFilterCommand из HTML."""
     lower = text.lower().strip()
     filter_info = None
     shape = None
     dimensions = None
 
-    # Фильтры
     for rus, eng in FILTERS.items():
         if rus in lower:
             import re
@@ -67,13 +65,11 @@ def parse_filter_command(text: str):
             filter_info = {"filter": eng, "filterName": rus, "intensity": intensity}
             break
 
-    # Формы
     for rus, eng in SHAPES.items():
         if rus in lower:
             shape = {"name": rus, "type": eng}
             break
 
-    # Размер
     import re
     m = re.search(r"размер\s+(\d+)\s*[xх]\s*(\d+)", text, re.IGNORECASE) or \
         re.search(r"(\d+)\s*[xх]\s*(\d+)", text, re.IGNORECASE)
@@ -85,10 +81,10 @@ def parse_filter_command(text: str):
     return {"filter": filter_info, "shape": shape, "dimensions": dimensions}
 
 
-# ==================== ФИЛЬТРЫ (порт из JS) ====================
+# ==================== УЛУЧШЕННЫЕ ФИЛЬТРЫ ====================
 def apply_pixel_filter(img: Image.Image, intensity: float) -> Image.Image:
-    """Пиксельный фильтр — усреднение блоков + смешивание."""
-    pixel_size = max(2, round(10 * intensity))
+    # Увеличили базовый размер пикселя, чтобы эффект был заметнее
+    pixel_size = max(3, round(25 * intensity)) 
     w, h = img.size
     src = img.load()
     out = img.copy()
@@ -101,48 +97,47 @@ def apply_pixel_filter(img: Image.Image, intensity: float) -> Image.Image:
             r, g, b = src[cx, cy][:3]
             for py in range(y, min(y + pixel_size, h)):
                 for px in range(x, min(x + pixel_size, w)):
+                    # Делаем смешивание более резким
                     orr, og, ob = dst[px, py][:3]
                     dst[px, py] = (
-                        int(r * intensity + orr * (1 - intensity)),
-                        int(g * intensity + og * (1 - intensity)),
-                        int(b * intensity + ob * (1 - intensity)),
+                        int(r * 0.9 + orr * 0.1),
+                        int(g * 0.9 + og * 0.1),
+                        int(b * 0.9 + ob * 0.1),
                     )
     return out
 
-
 def apply_sunset_filter(img: Image.Image, intensity: float) -> Image.Image:
     r, g, b = img.split()[:3]
-    r = r.point(lambda v: min(255, int(v * 1.3 + 30)) * intensity + v * (1 - intensity))
-    g = g.point(lambda v: int(v * 0.8 + 10) * intensity + v * (1 - intensity))
-    b = b.point(lambda v: int(v * 0.6) * intensity + v * (1 - intensity))
+    # Усилили красный и желтый
+    r = r.point(lambda v: min(255, int(v * 1.5 + 40)) * intensity + v * (1 - intensity))
+    g = g.point(lambda v: min(255, int(v * 0.9 + 20)) * intensity + v * (1 - intensity))
+    b = b.point(lambda v: int(v * 0.3) * intensity + v * (1 - intensity))
     return Image.merge("RGB", (r, g, b))
-
 
 def apply_bw_filter(img: Image.Image, intensity: float) -> Image.Image:
     gray = img.convert("L").convert("RGB")
+    # Усилили контраст для ч/б
+    enhancer = ImageEnhance.Contrast(gray)
+    gray = enhancer.enhance(1.5)
     return Image.blend(img, gray, intensity)
-
 
 def apply_pink_filter(img: Image.Image, intensity: float) -> Image.Image:
     r, g, b = img.split()[:3]
-    r = r.point(lambda v: min(255, int(v * 1.4 + 40)) * intensity + v * (1 - intensity))
-    g = g.point(lambda v: int(v * 0.7) * intensity + v * (1 - intensity))
-    b = b.point(lambda v: min(255, int(v * 1.2 + 20)) * intensity + v * (1 - intensity))
+    r = r.point(lambda v: min(255, int(v * 1.6 + 50)) * intensity + v * (1 - intensity))
+    g = g.point(lambda v: int(v * 0.5) * intensity + v * (1 - intensity))
+    b = b.point(lambda v: min(255, int(v * 1.4 + 30)) * intensity + v * (1 - intensity))
     return Image.merge("RGB", (r, g, b))
 
-
 def apply_shadow_filter(img: Image.Image, intensity: float) -> Image.Image:
+    # Затемнение с синеватым оттенком
     r, g, b = img.split()[:3]
-    def contrast(v, mult, add, c=1.2):
-        return max(0, min(255, int(((v * mult * add - 128) * c) + 128)))
-    r = r.point(lambda v: contrast(v, 0.6, 0.9) * intensity + v * (1 - intensity))
-    g = g.point(lambda v: contrast(v, 0.6, 0.8) * intensity + v * (1 - intensity))
-    b = b.point(lambda v: contrast(v, 0.6, 1.1) * intensity + v * (1 - intensity))
+    r = r.point(lambda v: int(v * 0.4) * intensity + v * (1 - intensity))
+    g = g.point(lambda v: int(v * 0.5) * intensity + v * (1 - intensity))
+    b = b.point(lambda v: min(255, int(v * 0.8 + 20)) * intensity + v * (1 - intensity))
     return Image.merge("RGB", (r, g, b))
 
 
 def apply_shape_crop(img: Image.Image, shape_type: str) -> Image.Image:
-    """Обрезка по форме (круг, квадрат, треугольник, сердце) с прозрачным фоном."""
     w, h = img.size
     mask = Image.new("L", (w, h), 0)
     draw = ImageDraw.Draw(mask)
@@ -158,7 +153,6 @@ def apply_shape_crop(img: Image.Image, shape_type: str) -> Image.Image:
     elif shape_type == "triangle":
         draw.polygon([(w / 2, 0), (0, h), (w, h)], fill=255)
     elif shape_type == "heart":
-        # Аппроксимация сердца через параметрическое уравнение
         scale = min(w, h) / 40
         pts = []
         for i in range(101):
@@ -174,18 +168,14 @@ def apply_shape_crop(img: Image.Image, shape_type: str) -> Image.Image:
 
 
 def process_image_with_commands(img: Image.Image, filter_info, shape_info, dimensions):
-    """Полный аналог processImageWithCommands из JS."""
-    # 1. Ресайз
     if dimensions:
         img = img.resize((dimensions["width"], dimensions["height"]), Image.LANCZOS)
     elif img.mode != "RGB":
         img = img.convert("RGB")
 
-    # 2. Обрезка по форме (делаем после ресайза)
     if shape_info:
         img = apply_shape_crop(img, shape_info["type"])
 
-    # Убедимся, что для фильтров RGB
     if img.mode != "RGB":
         base = Image.new("RGB", img.size, (0, 0, 0))
         base.paste(img, mask=img.split()[-1] if img.mode == "RGBA" else None)
@@ -193,7 +183,6 @@ def process_image_with_commands(img: Image.Image, filter_info, shape_info, dimen
     else:
         img_rgb = img
 
-    # 3. Фильтры
     if filter_info:
         intensity = filter_info["intensity"] / 100
         f = filter_info["filter"]
@@ -208,9 +197,7 @@ def process_image_with_commands(img: Image.Image, filter_info, shape_info, dimen
         elif f == "shadow":
             img_rgb = apply_shadow_filter(img_rgb, intensity)
 
-    # Если была форма — вернём RGBA (с прозрачностью по маске)
     if shape_info:
-        # Пересобираем с маской
         mask = img.split()[-1] if img.mode == "RGBA" else None
         final = img_rgb.convert("RGBA")
         if mask:
@@ -220,7 +207,6 @@ def process_image_with_commands(img: Image.Image, filter_info, shape_info, dimen
     return img_rgb
 
 
-# ==================== ХЕЛПЕРЫ ====================
 def image_to_bytes(img: Image.Image, fmt="PNG") -> bytes:
     buf = io.BytesIO()
     if fmt == "JPEG" and img.mode == "RGBA":
@@ -228,7 +214,6 @@ def image_to_bytes(img: Image.Image, fmt="PNG") -> bytes:
     img.save(buf, format=fmt)
     buf.seek(0)
     return buf.read()
-
 
 def describe_command(cmd) -> str:
     parts = []
@@ -254,154 +239,116 @@ WELCOME = (
     "1. Отправь изображение\n"
     "2. Напиши команду\n\n"
     "<b>Доступные команды:</b>\n"
-    "• <b>Только фильтры:</b> «пиксельный 50%», «закатный 75%», «черно-белый»\n"
-    "• <b>Только обрезка:</b> «квадрат», «круг», «треугольник», «сердце»\n"
-    "• <b>Только размер:</b> «размер 300x300», «500x500»\n"
-    "• <b>Комбинации:</b> «пиксельный 50% квадрат», «размер 800x600 круг»\n\n"
-    "✈️ /telegram — открыть Telegram Web"
+    "• <b>Фильтры:</b> «пиксельный 50%», «закатный 75%», «черно-белый»\n"
+    "• <b>Формы:</b> «квадрат», «круг», «треугольник», «сердце»\n"
+    "• <b>Размер:</b> «размер 300x300»\n"
+    "• <b>Комбинации:</b> «пиксельный 50% квадрат»"
 )
-
 
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
     await state.set_state(UserState.waiting_image)
     await message.answer(WELCOME, parse_mode=ParseMode.HTML)
 
-
-@router.message(Command("help"))
-async def cmd_help(message: Message):
-    await message.answer(WELCOME, parse_mode=ParseMode.HTML)
-
-
-@router.message(Command("telegram"))
-async def cmd_telegram(message: Message):
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Открыть Telegram Web", url="https://web.telegram.org/")]
-    ])
-    await message.answer("Нажми кнопку ниже:", reply_markup=kb)
-
-
 @router.message(F.photo)
 async def handle_photo(message: Message, state: FSMContext, bot: Bot):
-    # Берём максимальное разрешение
     photo = message.photo[-1]
     file = await bot.get_file(photo.file_id)
     file_bytes = await bot.download_file(file.file_path)
     img = Image.open(io.BytesIO(file_bytes.read()))
-
+    
+    # Конвертируем в RGB на всякий случай (чтобы не было ошибок с палитрой)
+    if img.mode != "RGB":
+        img = img.convert("RGB")
+        
     user_images[message.from_user.id] = img
     await state.set_state(UserState.waiting_command)
 
-    await message.answer(
-        "✅ Изображение получено!\n\n"
-        "Теперь напиши команду обработки. Примеры:\n"
-        "• <code>пиксельный 50%</code>\n"
-        "• <code>квадрат</code>\n"
-        "• <code>размер 300x300</code>\n"
-        "• <code>пиксельный 50% квадрат</code>\n"
-        "• <code>закатный 75% круг</code>",
-        parse_mode=ParseMode.HTML,
-    )
+    await message.answer("✅ Изображение получено! Напиши команду (например: <code>пиксельный 50%</code>)", parse_mode=ParseMode.HTML)
 
 
-@router.message(F.document)
-async def handle_document(message: Message, state: FSMContext, bot: Bot):
-    doc = message.document
-    if not doc.mime_type or not doc.mime_type.startswith("image/"):
-        await message.answer("Пожалуйста, отправь файл изображения (JPG, PNG, GIF).")
-        return
-    file = await bot.get_file(doc.file_id)
-    file_bytes = await bot.download_file(file.file_path)
-    try:
-        img = Image.open(io.BytesIO(file_bytes.read()))
-    except Exception:
-        await message.answer("Не удалось прочитать изображение.")
-        return
-    user_images[message.from_user.id] = img
-    await state.set_state(UserState.waiting_command)
-    await message.answer("✅ Изображение получено! Напиши команду обработки.")
+# ==================== АНИМАЦИЯ ОБРАБОТКИ ====================
+async def simulate_processing(message: Message, bot: Bot, cmd_desc: str):
+    # Этап 1
+    msg = await message.answer(f"🖼️ <b>Начинаю обработку...</b>\n\n{cmd_desc}\n\n[░░░░░░░░░░] 0%")
+    await asyncio.sleep(1.5)
+    
+    # Этап 2 (Редактируем сообщение)
+    await msg.edit_text(f"🖼️ <b>Начинаю обработку...</b>\n\n{cmd_desc}\n\n[███░░░░░░░] 30%\n🔍 <i>Анализ изображения...</i>", parse_mode=ParseMode.HTML)
+    
+    # Отправляем гифку, если она есть в папке
+    if os.path.exists("loading.gif"):
+        try:
+            await message.answer_animation(
+                animation=BufferedInputFile(open("loading.gif", "rb").read(), filename="loading.gif"),
+                caption="⚙️ Применяю эффекты..."
+            )
+        except Exception as e:
+            logger.error(f"Не удалось отправить гифку: {e}")
+            
+    await asyncio.sleep(2)
+    
+    # Этап 3
+    await msg.edit_text(f"🖼️ <b>Начинаю обработку...</b>\n\n{cmd_desc}\n\n[██████░░░░] 60%\n⚙️ <i>Наложение фильтров...</i>", parse_mode=ParseMode.HTML)
+    await asyncio.sleep(2)
+    
+    await msg.edit_text(f"🖼️ <b>Начинаю обработку...</b>\n\n{cmd_desc}\n\n[█████████░] 90%\n✨ <i>Финальная обработка...</i>", parse_mode=ParseMode.HTML)
+    await asyncio.sleep(1)
+    
+    await msg.edit_text(f"🖼️ <b>Начинаю обработку...</b>\n\n{cmd_desc}\n\n[██████████] 100%\n✅ <i>Готово!</i>", parse_mode=ParseMode.HTML)
+    return msg
 
 
 @router.message(F.text)
-async def handle_text(message: Message, state: FSMContext):
+async def handle_text(message: Message, state: FSMContext, bot: Bot):
     text = message.text
-    lower = text.lower().strip()
     uid = message.from_user.id
-
-    # Приветствие
-    if "привет" in lower or "здравствуй" in lower:
-        await message.answer("Привет! Отправь изображение 📷, затем напиши команду.")
-        return
-
-    # Telegram
-    if "telegram" in lower or "телеграм" in lower:
-        await cmd_telegram(message)
-        return
-
     img = user_images.get(uid)
-    if img is None:
-        await message.answer(
-            "Сначала отправь изображение 📷, затем напиши команду.\n"
-            "Примеры: «пиксельный 50%», «квадрат», «размер 300x300»."
-        )
+    
+    if not img:
+        await message.answer("Сначала отправь изображение 📷, затем напиши команду.")
         return
 
-    # Парсим команду
     cmd = parse_filter_command(text)
-
     if not (cmd["filter"] or cmd["shape"] or cmd["dimensions"]):
-        await message.answer(
-            "Не понял команду. Примеры:\n"
-            "• <code>пиксельный 50%</code>\n"
-            "• <code>квадрат</code>\n"
-            "• <code>размер 300x300</code>\n"
-            "• <code>пиксельный 50% квадрат</code>",
-            parse_mode=ParseMode.HTML,
-        )
+        await message.answer("Не понял команду. Примеры:\n• <code>пиксельный 50%</code>\n• <code>квадрат</code>", parse_mode=ParseMode.HTML)
         return
 
-    # Сообщение «в обработке»
-    status = await message.answer(
-        f"🖼️ <b>Начинаю обработку...</b>\n\n{describe_command(cmd)}\n\n⏳ Подожди несколько секунд...",
-        parse_mode=ParseMode.HTML,
-    )
+    # Запускаем анимацию
+    desc = describe_command(cmd)
+    status_msg = await simulate_processing(message, bot, desc)
 
     try:
-        # Небольшая пауза для UX (как в оригинале)
-        await asyncio.sleep(1.5)
-        result = process_image_with_commands(
-            img.copy(),
-            cmd["filter"],
-            cmd["shape"],
-            cmd["dimensions"],
+        # Обрабатываем в фоне (чтобы бот не завис на больших фото)
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(
+            None, 
+            process_image_with_commands, 
+            img.copy(), cmd["filter"], cmd["shape"], cmd["dimensions"]
         )
 
-        # Если есть прозрачность — PNG, иначе JPEG
-        if result.mode == "RGBA":
-            fmt, mime, ext = "PNG", "image/png", "png"
-        else:
-            fmt, mime, ext = "JPEG", "image/jpeg", "jpg"
-
+        fmt = "PNG" if result.mode == "RGBA" else "JPEG"
+        ext = "png" if fmt == "PNG" else "jpg"
         data = image_to_bytes(result, fmt)
 
-        caption = f"✅ <b>Обработка завершена</b>\n\n{describe_command(cmd)}"
+        # Отправляем финальный результат
         await message.answer_photo(
             BufferedInputFile(data, filename=f"gotik_ai_result.{ext}"),
-            caption=caption,
+            caption=f"✅ <b>Обработка завершена</b>\n\n{desc}",
             parse_mode=ParseMode.HTML,
         )
-        await status.delete()
+        
+        # Удаляем сообщение с прогресс-баром, чтобы не мусорить
+        await status_msg.delete()
         await state.set_state(UserState.waiting_image)
 
     except Exception as e:
         logger.exception("Ошибка обработки: %s", e)
-        await status.edit_text("❌ Ошибка при обработке изображения. Попробуй ещё раз.")
+        await status_msg.edit_text("❌ Ошибка при обработке изображения.")
 
-
-# ==================== HEALTHCHECK ДЛЯ RENDER ====================
+# ==================== HEALTHCHECK ====================
 async def health(request):
     return web.Response(text="OK")
-
 
 async def start_web_server():
     app = web.Application()
@@ -411,24 +358,15 @@ async def start_web_server():
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
-    logger.info("Healthcheck на порту %s", PORT)
 
-
-# ==================== ЗАПУСК ====================
 async def main():
     if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN не задан в переменных окружения!")
-
+        raise RuntimeError("BOT_TOKEN не задан!")
     bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
-
-    # Запускаем healthcheck
     asyncio.create_task(start_web_server())
-
-    logger.info("Бот запущен")
     await dp.start_polling(bot)
-
 
 if __name__ == "__main__":
     asyncio.run(main())
