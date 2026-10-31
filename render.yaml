@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: gotik-ai-bot
+    runtime: docker
+    plan: free
+    region: frankfurt
+    dockerfilePath: ./Dockerfile
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+    healthCheckPath: /health
