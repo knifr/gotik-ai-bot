@@ -10,6 +10,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY bot.py .
+# Копируем гифку, если она есть (не вызовет ошибку, если файла нет)
 COPY loading.gif* . 
 
 ENV PORT=8080
