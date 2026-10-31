@@ -3,3 +3,6 @@ Pillow==10.4.0
 aiohttp==3.10.5
 python-dotenv==1.0.1
 duckduckgo-search
+sympy
+pytesseract
+yt-dlp
